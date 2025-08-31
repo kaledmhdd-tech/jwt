@@ -5,7 +5,6 @@ import binascii
 import requests
 import my_pb2
 import output_pb2
-import jwt
 
 app = Flask(__name__)
 
@@ -76,12 +75,34 @@ def majorlogin_jwt():
 
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
+
+        # محاولة فك Protobuf
         try:
-            return jsonify(response.json()), response.status_code
-        except ValueError:
-            return response.text, response.status_code
+            example_msg = output_pb2.Garena_420()
+            example_msg.ParseFromString(response.content)
+
+            server_type = getattr(example_msg, "country_code", "Unknown")  # أو region حسب البروتوباف
+            token_value = getattr(example_msg, "token", None)
+
+            return jsonify({
+                "server": server_type,
+                "token": token_value
+            }), 200
+
+        except Exception:
+            # إذا لم يكن Protobuf، حاول JSON
+            try:
+                data = response.json()
+                return jsonify({
+                    "server": data.get("country_code", "Unknown"),
+                    "token": data.get("token")
+                }), response.status_code
+            except ValueError:
+                return jsonify({"message": "Unable to parse server response"}), response.status_code
+
     except requests.RequestException as e:
         return jsonify({"message": str(e)}), 500
+
 
 @app.route('/api/oauth_guest', methods=['GET'])
 def oauth_guest():
@@ -124,7 +145,7 @@ def oauth_guest():
     if 'access_token' not in oauth_data or 'open_id' not in oauth_data:
         return jsonify({"message": "OAuth response missing access_token or open_id"}), 500
 
-    # إعادة توجيه مباشرة إلى majorlogin_jwt وعرض كل الرد
+    # إعادة توجيه مباشرة إلى majorlogin_jwt وعرض السيرفر والتوكن فقط
     params = {
          'access_token': oauth_data['access_token'],
          'open_id': oauth_data['open_id'],
@@ -132,6 +153,7 @@ def oauth_guest():
     }
     with app.test_request_context('/api/majorlogin_jwt', query_string=params):
          return majorlogin_jwt()
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
