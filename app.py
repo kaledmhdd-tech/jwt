@@ -5,14 +5,16 @@ import binascii
 import requests
 import my_pb2
 import output_pb2
-import jwt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+from concurrent.futures import ThreadPoolExecutor
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=200)  # حتى 200 نافذة متوازية
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
-executor = ThreadPoolExecutor(max_workers=200)  # ⚡ تشغيل حتى 200 نافذة متوازية
 
 
 def encrypt_message(plaintext):
@@ -21,11 +23,19 @@ def encrypt_message(plaintext):
     return cipher.encrypt(padded_message)
 
 
-def send_major_request(params):
-    """تنفيذ طلب MajorLogin"""
-    access_token = params["access_token"]
-    open_id = params["open_id"]
-    platform_type = params["platform_type"]
+@app.route('/api/majorlogin_jwt', methods=['GET'])
+def majorlogin_jwt():
+    access_token = request.args.get('access_token')
+    open_id = request.args.get('open_id')
+    platform_type = request.args.get('platform_type')
+
+    if not access_token or not open_id or not platform_type:
+        return jsonify({"message": "missing access_token, open_id, platform_type"}), 400
+
+    try:
+        platform_type = int(platform_type)
+    except ValueError:
+        return jsonify({"message": "invalid platform_type"}), 400
 
     game_data = my_pb2.GameData()
     game_data.timestamp = "2024-12-05 18:15:32"
@@ -54,7 +64,8 @@ def send_major_request(params):
 
     serialized_data = game_data.SerializeToString()
     encrypted_data = encrypt_message(serialized_data)
-    hex_encrypted_data = binascii.hexlify(encrypted_data).decode('utf-8')
+    edata = binascii.hexlify(encrypted_data).decode('utf-8')
+    edata = bytes.fromhex(edata)
 
     url = "https://loginbp.ggblueshark.com/MajorLogin"
     headers = {
@@ -67,7 +78,6 @@ def send_major_request(params):
         "X-GA": "v1 1",
         "ReleaseVersion": "OB48"
     }
-    edata = bytes.fromhex(hex_encrypted_data)
 
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
@@ -75,49 +85,31 @@ def send_major_request(params):
             try:
                 example_msg = output_pb2.Garena_420()
                 example_msg.ParseFromString(response.content)
-                return {field.name: getattr(example_msg, field.name)
-                        for field in example_msg.DESCRIPTOR.fields
-                        if field.name not in ["binary", "binary_data", "Garena420"]}
+                data_dict = {field.name: getattr(example_msg, field.name)
+                             for field in example_msg.DESCRIPTOR.fields
+                             if field.name not in ["binary", "binary_data", "Garena420"]}
             except Exception:
-                return {"message": response.text}
+                try:
+                    data_dict = response.json()
+                except ValueError:
+                    return jsonify({"message": response.text}), 200
+
+            if data_dict:
+                data_dict["developer"] = "@BNGX"
+                return jsonify(data_dict), 200
+            else:
+                return jsonify({"message": "No data found"}), 200
         else:
-            return {"status": response.status_code, "message": response.text}
+            return jsonify({"message": response.text}), response.status_code
     except requests.RequestException as e:
-        return {"error": str(e)}
-
-
-@app.route('/api/majorlogin_jwt', methods=['GET'])
-def majorlogin_jwt():
-    access_token = request.args.get('access_token')
-    open_id = request.args.get('open_id')
-    platform_type = request.args.get('platform_type')
-
-    if not access_token or not open_id or not platform_type:
-        return jsonify({"message": "missing access_token, open_id, platform_type"}), 400
-
-    try:
-        platform_type = int(platform_type)
-    except ValueError:
-        return jsonify({"message": "invalid platform_type"}), 400
-
-    params = {"access_token": access_token, "open_id": open_id, "platform_type": platform_type}
-
-    # 🔥 تنفيذ حتى 200 طلب متوازي
-    futures = [executor.submit(send_major_request, params) for _ in range(200)]
-
-    results = []
-    for future in as_completed(futures):
-        result = future.result()
-        result["developer"] = "@BNGX"
-        results.append(result)
-
-    return jsonify({"total": len(results), "results": results}), 200
+        return jsonify({"message": str(e)}), 500
 
 
 @app.route('/api/oauth_guest', methods=['GET'])
 def oauth_guest():
     uid = request.args.get('uid')
     password = request.args.get('password')
+
     if not uid or not password:
         return jsonify({"message": "Missing uid or password"}), 400
 
@@ -136,34 +128,43 @@ def oauth_guest():
         'Accept-Encoding': "gzip"
     }
 
-    try:
-        oauth_response = requests.post(oauth_url, data=payload, headers=headers, timeout=5)
-    except requests.RequestException as e:
-        return jsonify({"message": str(e)}), 500
-
-    if oauth_response.status_code != 200:
+    def process_request():
         try:
-            return jsonify(oauth_response.json()), oauth_response.status_code
-        except ValueError:
-            return jsonify({"message": oauth_response.text}), oauth_response.status_code
+            oauth_response = requests.post(oauth_url, data=payload, headers=headers, timeout=10)
+            if oauth_response.status_code != 200:
+                return {"message": oauth_response.text}
+            oauth_data = oauth_response.json()
+            if 'access_token' not in oauth_data or 'open_id' not in oauth_data:
+                return {"message": "OAuth missing fields", "data": oauth_data}
 
-    try:
-        oauth_data = oauth_response.json()
-    except ValueError:
-        return jsonify({"message": "Invalid JSON response from OAuth service"}), 500
+            params = {
+                'access_token': oauth_data['access_token'],
+                'open_id': oauth_data['open_id'],
+                'platform_type': str(oauth_data.get('platform', 4))
+            }
+            with app.test_request_context('/api/majorlogin_jwt', query_string=params):
+                return majorlogin_jwt().json
+        except Exception as e:
+            return {"message": str(e)}
 
-    if 'access_token' not in oauth_data or 'open_id' not in oauth_data:
-        return jsonify({"message": "OAuth response missing access_token or open_id"}), 500
-
-    params = {
-        'access_token': oauth_data['access_token'],
-        'open_id': oauth_data['open_id'],
-        'platform_type': str(oauth_data.get('platform', 4))
-    }
-
-    with app.test_request_context('/api/majorlogin_jwt', query_string=params):
-        return majorlogin_jwt()
+    future = executor.submit(process_request)
+    result = future.result()
+    return jsonify(result)
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+@app.route('/')
+def index():
+    return jsonify({
+        "status": "API Running Successfully ✅",
+        "endpoints": [
+            "/api/oauth_guest?uid=...&password=...",
+            "/api/majorlogin_jwt?access_token=...&open_id=...&platform_type=4"
+        ],
+        "developer": "@BNGX"
+    })
+
+
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
