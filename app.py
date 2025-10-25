@@ -143,7 +143,7 @@ def oauth_guest():
                 'platform_type': str(oauth_data.get('platform', 4))
             }
             with app.test_request_context('/api/majorlogin_jwt', query_string=params):
-                return majorlogin_jwt().json
+                return majorlogin_jwt()
         except Exception as e:
             return {"message": str(e)}
 
